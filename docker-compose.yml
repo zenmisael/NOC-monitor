@@ -1,0 +1,21 @@
+version: "3.8"
+
+services:
+  noc:
+    build: .
+    container_name: noc-monitor
+    ports:
+      - "5000:5000"
+
+    volumes:
+      - ./data:/app/data
+
+    cap_add:
+      - NET_RAW
+
+    environment:
+      TZ: Asia/Jakarta
+      TELEGRAM_TOKEN: THIS_IS_YOUR_BOT_TOKEN
+      TELEGRAM_CHAT_ID: CHATID
+
+    restart: unless-stopped
