@@ -15,7 +15,7 @@ time.tzset()
 
 DB = "data/monitor.db"
 CHECK_INTERVAL = 5
-FAIL_THRESHOLD = 3
+FAIL_THRESHOLD = 2
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -41,6 +41,7 @@ def init_db():
     CREATE TABLE IF NOT EXISTS targets (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT,
+        description TEXT,
         monitor_type TEXT,
         monitor_port TEXT,
         status TEXT DEFAULT 'Online',
@@ -50,6 +51,12 @@ def init_db():
         last_latency REAL DEFAULT 0
     )
     """)
+
+    # Auto migration for old DB
+    try:
+        c.execute("ALTER TABLE targets ADD COLUMN description TEXT")
+    except:
+        pass
 
     c.execute("""
     CREATE TABLE IF NOT EXISTS incidents (
@@ -63,15 +70,6 @@ def init_db():
     """)
 
     c.execute("""
-    CREATE TABLE IF NOT EXISTS latency_history (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        target_id INTEGER,
-        latency REAL,
-        timestamp TEXT
-    )
-    """)
-
-    c.execute("""
     CREATE TABLE IF NOT EXISTS users (
         username TEXT PRIMARY KEY,
         password TEXT,
@@ -79,6 +77,7 @@ def init_db():
     )
     """)
 
+    # Default users
     if not c.execute("SELECT 1 FROM users WHERE username='admin'").fetchone():
         pwd = hashlib.sha256("admin123".encode()).hexdigest()
         c.execute("INSERT INTO users VALUES (?,?,?)", ("admin", pwd, "admin"))
@@ -109,7 +108,7 @@ def send_telegram(msg):
         pass
 
 
-# ---------------- ROUTES ----------------
+# ---------------- AUTH ----------------
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
@@ -147,27 +146,57 @@ def index():
     return render_template("index.html")
 
 
+# ---------------- TARGET MANAGEMENT ----------------
+
 @app.route("/add", methods=["POST"])
 def add():
     if session.get("role") != "admin":
         return "Forbidden", 403
 
     name = request.form.get("name")
+    description = request.form.get("description")
     mtype = request.form.get("monitor_type")
     port = request.form.get("monitor_port")
 
+    if not description or description.strip() == "":
+        return jsonify({"error": "Description required"}), 400
+
     conn = get_db()
     conn.execute(
-        "INSERT INTO targets (name,monitor_type,monitor_port) VALUES (?,?,?)",
-        (name, mtype, port)
+        "INSERT INTO targets (name,description,monitor_type,monitor_port) VALUES (?,?,?,?)",
+        (name, description, mtype, port)
     )
     conn.commit()
     conn.close()
 
     detail = f"{mtype.upper()}:{port}" if mtype == "tcp" else "ICMP"
-    send_telegram(f"➕ MONITOR ADDED\nHost: {name}\nCheck: {detail}")
+
+    send_telegram(
+        f"➕ MONITOR ADDED\n"
+        f"Host: {name}\n"
+        f"Desc: {description}\n"
+        f"Check: {detail}"
+    )
 
     return jsonify({"status": "ok"})
+
+
+@app.route("/update_description/<int:id>", methods=["POST"])
+def update_description(id):
+    if session.get("role") != "admin":
+        return "Forbidden", 403
+
+    new_desc = request.form.get("description")
+
+    if not new_desc or new_desc.strip() == "":
+        return jsonify({"error": "Description required"}), 400
+
+    conn = get_db()
+    conn.execute("UPDATE targets SET description=? WHERE id=?", (new_desc, id))
+    conn.commit()
+    conn.close()
+
+    return jsonify({"status": "updated"})
 
 
 @app.route("/remove/<int:id>", methods=["POST"])
@@ -177,9 +206,21 @@ def remove(id):
 
     conn = get_db()
     row = conn.execute("SELECT * FROM targets WHERE id=?", (id,)).fetchone()
+
     if row:
-        detail = f"{row['monitor_type'].upper()}:{row['monitor_port']}" if row["monitor_type"] == "tcp" else "ICMP"
-        send_telegram(f"➖ MONITOR REMOVED\nHost: {row['name']}\nCheck: {detail}")
+        detail = (
+            f"{row['monitor_type'].upper()}:{row['monitor_port']}"
+            if row["monitor_type"] == "tcp"
+            else "ICMP"
+        )
+
+        send_telegram(
+            f"➖ MONITOR REMOVED\n"
+            f"Host: {row['name']}\n"
+            f"Desc: {row['description']}\n"
+            f"Check: {detail}"
+        )
+
         conn.execute("DELETE FROM targets WHERE id=?", (id,))
         conn.commit()
 
@@ -231,7 +272,7 @@ def clear_incidents():
     return jsonify({"status": "cleared"})
 
 
-# ---------------- MONITOR LOOP ----------------
+# ---------------- MONITOR ENGINE ----------------
 
 async def check_icmp(host):
     try:
@@ -259,7 +300,11 @@ async def monitor_loop():
 
         for t in targets:
 
-            detail = f"TCP:{t['monitor_port']}" if t["monitor_type"] == "tcp" else "ICMP"
+            detail = (
+                f"TCP:{t['monitor_port']}"
+                if t["monitor_type"] == "tcp"
+                else "ICMP"
+            )
 
             if t["monitor_type"] == "tcp":
                 status, latency = await check_tcp(t["name"], t["monitor_port"])
@@ -272,11 +317,19 @@ async def monitor_loop():
                 if t["status"] == "Offline":
                     duration = "-"
                     if t["last_down"]:
-                        down_time = datetime.strptime(t["last_down"], "%Y-%m-%d %H:%M:%S")
+                        down_time = datetime.strptime(
+                            t["last_down"], "%Y-%m-%d %H:%M:%S"
+                        )
                         duration = str(datetime.now() - down_time)
 
                     if t["maintenance"] == 0:
-                        send_telegram(f"🟢 BACK ONLINE\nHost: {t['name']}\nCheck: {detail}\nDuration: {duration}")
+                        send_telegram(
+                            f"🟢 BACK ONLINE\n"
+                            f"Host: {t['name']}\n"
+                            f"Desc: {t['description']}\n"
+                            f"Check: {detail}\n"
+                            f"Duration: {duration}"
+                        )
 
                     c.execute("""
                         INSERT INTO incidents (target, monitor_detail, down_time, up_time, duration)
@@ -298,7 +351,14 @@ async def monitor_loop():
                 if fail >= FAIL_THRESHOLD:
                     if t["status"] != "Offline":
                         if t["maintenance"] == 0:
-                            send_telegram(f"🔴 HOST DOWN\nHost: {t['name']}\nCheck: {detail}")
+                            send_telegram(
+                                f"🔴 HOST DOWN\n"
+                                f"Host: {t['name']}\n"
+                                f"Desc: {t['description']}\n"
+                                f"Check: {detail}\n"
+                                f"Time: {now}"
+                            )
+
                         c.execute("""
                             UPDATE targets SET
                             status='Offline',
@@ -307,7 +367,10 @@ async def monitor_loop():
                             WHERE id=?
                         """, (now, fail, t["id"]))
                 else:
-                    c.execute("UPDATE targets SET fail_count=? WHERE id=?", (fail, t["id"]))
+                    c.execute(
+                        "UPDATE targets SET fail_count=? WHERE id=?",
+                        (fail, t["id"])
+                    )
 
         conn.commit()
         conn.close()
