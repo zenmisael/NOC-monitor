@@ -1,6 +1,7 @@
 # NOC-monitor
 default user/pass are admin:admin123 and viewwer:viewer123
-## Usage:  
+## Usage: 
+clone or download than run
 ```bash
 docker compose build --no-cache
 docker compose up -d
