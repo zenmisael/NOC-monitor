@@ -1,5 +1,5 @@
 # NOC-monitor
-default user/pass are admin:admin123 and viewwer:viewer123
+default user/pass are admin:admin123 and viewer:viewer123
 ## Usage: 
 clone or download than run
 ```bash
